@@ -21,6 +21,9 @@ module Data.Stream.Future
   , tail
   , length
   , index
+  , tomorrow
+  , daysAfter
+  , predict
   ) where
 
 #if MIN_VERSION_base(4,8,0)
@@ -34,6 +37,7 @@ import Data.Foldable
 import Control.Comonad
 import Data.Functor.Alt
 import Data.Functor.Extend
+import Data.Functor.Bind
 import Data.Traversable
 #if !(MIN_VERSION_base(4,11,0))
 import Data.Semigroup hiding (Last)
@@ -80,6 +84,38 @@ index n aas
     Last _ -> error "index: out of range"
     _ :< as -> index (n - 1) as
 
+-- | 'tail' but @'tomorrow' ('Last' a) = Last a@.
+--
+-- > duplicate . tomorrow = tomorrow . duplicate
+tomorrow :: Future a -> Future a
+tomorrow (_ :< as) = as
+tomorrow (Last a)  = Last a
+{-# INLINE tomorrow #-}
+
+-- | Repeated 'tomorrow'
+daysAfter :: Int -> Future a -> Future a
+daysAfter !n aas
+  | n <= 0    = aas
+  | otherwise = case aas of
+      Last _  -> aas
+      _ :< as -> daysAfter (pred n) as
+
+-- | 'index' but returns the last value for indices larger than
+--   the last index.
+--   
+--   It's 'predict' because it guesses the stream will repeat
+--   the same value after the last index.
+--   
+--   > predict 0 = extract
+--   > predict k = extract . daysAfter k
+predict :: Int -> Future a -> a
+predict n aas
+  | n < 0 = error "predict: negative index"
+  | otherwise = case aas of
+      Last a              -> a
+      a :< as | n == 0    -> a
+              | otherwise -> predict (n - 1) as
+
 instance Functor Future where
   fmap f (a :< as) = f a :< fmap f as
   fmap f (Last a)  = Last (f a)
@@ -120,19 +156,25 @@ instance Comonad Future where
   extend f w@(_ :< as) = f w :< extend f as
   extend f w@(Last _)  = Last (f w)
 
+-- | Zipping adjusts to the longer stream.
 instance Apply Future where
-  Last f    <.> Last a    = Last (f a)
-  (f :< _)  <.> Last a    = Last (f a)
-  Last f    <.> (a :< _ ) = Last (f a)
+  Last f <.> as     = fmap f as
+  fs     <.> Last a = fmap ($ a) fs
   (f :< fs) <.> (a :< as) = f a :< (fs <.> as)
 
   Last a    <. _         = Last a
-  (a :< _ ) <. Last _    = Last a
+  as        <. Last _    = as
   (a :< as) <. (_ :< bs) = a :< (as <. bs)
 
-  _          .> Last b   = Last b
-  Last _     .> (b :< _) = Last b
+  _          .> Last b    = Last b
+  Last _     .> bs        = bs
   (_ :< as)  .> (b :< bs) = b :< (as .> bs)
+
+instance Bind Future where
+  aas >>- k = go 0 aas
+    where
+      go !i (Last a)  = i `daysAfter` k a
+      go !i (a :< as) = predict i (k a) :< go (succ i) as
 
 instance ComonadApply Future where
   (<@>) = (<.>)
@@ -149,6 +191,13 @@ instance Applicative Future where
   (<*>) = (<.>)
   (<* ) = (<. )
   ( *>) = ( .>)
+
+instance Monad Future where
+  (>>=) = (>>-)
+#if !(MIN_VERSION_base(4,11,0))
+  return = pure
+  _ >> bs = bs
+#endif
 
 #if MIN_VERSION_base(4,7,0)
 instance Exts.IsList (Future a) where
