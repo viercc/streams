@@ -1,4 +1,5 @@
 {-# LANGUAGE PatternGuards, BangPatterns, TypeFamilies #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE CPP #-}
 #if __GLASGOW_HASKELL__ >= 702
 {-# LANGUAGE Trustworthy #-}
@@ -32,7 +33,11 @@ module Data.Stream.Future.Skew
     , index     -- O(log n)
     , drop      -- O(log n)
     , dropWhile -- O(n)
+    , tomorrow  -- O(1)
+    , daysAfter -- O(log n)
+    , predict   -- O(log n)
     , indexed
+    , repeat
     , from
     , break
     , span
@@ -51,6 +56,7 @@ import Control.Applicative hiding (empty)
 import Control.Comonad
 import Data.Functor.Alt
 import Data.Functor.Extend
+import Data.Functor.Bind
 #if MIN_VERSION_base(4,8,0)
 import Prelude hiding (tail, drop, dropWhile, last, span, repeat, replicate, break)
 import Data.Foldable (toList)
@@ -67,6 +73,9 @@ import Data.Semigroup.Traversable
 #if MIN_VERSION_base(4,7,0)
 import qualified GHC.Exts as Exts
 #endif
+
+import Control.Monad.Trans.State.Lazy
+import qualified Data.Stream.Future as Linear
 
 infixr 5 :<, <|
 
@@ -150,29 +159,62 @@ extendTree g w@Tip{}         f = Tip (g (f w))
 extendTree g w@(Bin n _ l r) f = Bin n (g (f w)) (extendTree g l (:< f r))  (extendTree g r f)
 
 instance Apply Future where
-  Last (Tip f)         <.> as                   = singleton (f (extract as))
-  fs                   <.> Last (Tip a)         = singleton (extract fs a)
-  Last (Bin _ f lf rf) <.> Last (Bin _ a la ra) = f a <| (lf :< Last rf  <.> la :< Last ra )
-  Last (Bin _ f lf rf) <.> Bin _ a la ra :< as  = f a <| (lf :< Last rf  <.> la :< ra :< as)
-  Last (Bin _ f lf rf) <.> Tip a :< as          = f a <| (lf :< Last rf  <.> as            )
-  Bin _ f lf rf :< fs  <.> Last (Bin _ a la ra) = f a <| (lf :< rf :< fs <.> la :< Last ra )
-  Bin _ f lf rf :< fs  <.> Tip a :< as          = f a <| (lf :< rf :< fs <.> as            )
-  Bin _ f lf rf :< fs  <.> Bin _ a la ra :< as  = f a <| (lf :< rf :< fs <.> la :< ra :< as)
-  Tip f :< fs          <.> Tip a :< as          = f a <| (fs             <.> as            )
-  Tip f :< fs          <.> Bin _ a la ra :< as  = f a <| (fs             <.> la :< ra :< as)
-  Tip f :< fs          <.> Last (Bin _ a la ra) = f a <| (fs             <.> la :< Last ra )
+  Last (Tip f)         <.> as                   = fmap f as
+  fs                   <.> Last (Tip a)         = fmap ($ a) fs
+  fs <.> as
+    | length fs <= length as = evalState (applyWalk ($) as) fs
+    | otherwise              = evalState (applyWalk (flip ($)) fs) as
+
+applyWalk :: (a -> b -> c) -> Future b -> State (Future a) (Future c)
+applyWalk f = walk
+  where
+    walk (t :< bs) = (:<) <$> go t <*> walk bs
+    walk (Last t)  = Last <$> go t
+    
+    -- go is equivalent to traverse, but shortcuts to fmap
+    -- after the input stream was consumed to last one element
+    go t = do
+      (a, next) <- gets uncons
+      case next of
+        Nothing  -> return (fmap (f a) t)
+        Just as' -> do
+          put as'
+          case t of
+            Tip b -> return (Tip (f a b))
+            Bin w b l r -> Bin w (f a b) <$> go l <*> go r
 
 instance ComonadApply Future where
   (<@>) = (<.>)
 
 instance Applicative Future where
-  pure a0 = go a0 (Tip a0) where
-    go :: a -> Complete a -> Future a
-    go a as | ass <- bin a as as = as :< go a ass
+  pure = Last . Tip
   (<*>) = (<.>)
 
 instance Alt Future where
   as <!> bs = foldr (<|) bs as
+
+instance Bind Future where
+  as >>- k =
+    let bss = fmap k as
+        len = max (length bss) (length (last bss))
+    in evalState (sequence (replicate len poll)) (linearJoin bss)
+
+poll :: Monad m => StateT (Linear.Future a) m a
+poll = get >>= \case
+  Linear.Last a  -> return a
+  a Linear.:< as -> put as >> return a
+
+toLinear :: Future a -> Linear.Future a
+toLinear as = case uncons as of
+  (a, Nothing)  -> Linear.Last a
+  (a, Just as') -> a Linear.:< toLinear as'
+
+linearJoin :: Future (Future a) -> Linear.Future a
+linearJoin = go 0
+  where
+    go !i ass = case uncons ass of
+      (as, Nothing)   -> toLinear (i `daysAfter` as)
+      (as, Just ass') -> predict i as Linear.:< go (succ i) ass'
 
 instance Foldable Future where
   foldMap f (t :< ts) = foldMap f t `mappend` foldMap f ts
@@ -233,8 +275,12 @@ indexed :: Future a -> Future (Int, a)
 indexed = mapWithIndex (,)
 {-# INLINE indexed #-}
 
+repeat :: a -> Future a
+repeat a = go (Tip a)
+  where go as = as :< go (bin a as as)
+
 from :: Num a => a -> Future a
-from a = mapWithIndex ((+) . fromIntegral) (pure a)
+from a = mapWithIndex ((+) . fromIntegral) (repeat a)
 {-# INLINE from #-}
 
 -- | /O(1)/
@@ -269,9 +315,11 @@ tail (Last (Bin _ _ l r)) = Just (l :< Last r)
 -- | /O(log n)/.
 last :: Future a -> a
 last (_ :< as) = last as
-last (Last as) = go as
-  where go (Tip a) = a
-        go (Bin _ _ _ r) = go r
+last (Last as) = lastComplete as
+
+lastComplete :: Complete a -> a
+lastComplete (Tip a) = a
+lastComplete (Bin _ _ _ r) = lastComplete r
 
 -- | /O(1)/.
 uncons :: Future a -> (a, Maybe (Future a))
@@ -328,6 +376,51 @@ dropWhile :: (a -> Bool) -> Future a -> Maybe (Future a)
 dropWhile p as
   | p (extract as) = tail as >>= dropWhile p
   | otherwise = Just as
+
+-- /O(1)/. Repeats-after-last variant of 'tail'
+tomorrow :: Future a -> Future a
+tomorrow (Tip{} :< ts) = ts
+tomorrow (Bin _ _ l r :< ts) = l :< r :< ts
+tomorrow a@(Last Tip{}) = a
+tomorrow (Last (Bin _ _ l r)) = l :< Last r
+{-# INLINE tomorrow #-}
+
+-- /O(log n)/. Repeats-after-last variant of 'drop'
+daysAfter :: Int -> Future a -> Future a
+daysAfter 0 ts = ts
+daysAfter i (t :< ts) = case compare i w of
+  LT -> daysAfterComplete i t (:< ts)
+  EQ -> ts
+  GT -> daysAfter (i - w) ts
+  where w = weight t
+daysAfter i (Last t) = daysAfterComplete i t Last
+
+daysAfterComplete :: Int -> Complete a -> (Complete a -> Future a) -> Future a
+daysAfterComplete 0 t f             = f t
+daysAfterComplete _ t@(Tip _) f     = f t
+daysAfterComplete 1 (Bin _ _ l r) f = l :< f r
+daysAfterComplete i (Bin w _ l r) f = case compare (i - 1) w' of
+  LT -> daysAfterComplete (i-1) l (:< f r)
+  EQ -> f r
+  GT -> daysAfterComplete (i-1-w') r f
+  where w' = div w 2
+
+-- /O(log n). Repeats-after-last variant of 'index'
+predict :: Int -> Future a -> a
+predict i _ | i < 0 = error "predict: negative index"
+predict i (Last t) = indexComplete i t
+predict i (t :< ts)
+  | i < w     = predictComplete i t
+  | otherwise = predict (i - w) ts
+  where w = weight t
+
+predictComplete :: Int -> Complete a -> a
+predictComplete _ (Tip a) = a
+predictComplete i (Bin w a l r)
+  | i == 0    = a
+  | i <= w'   = predictComplete (i-1) l
+  | otherwise = predictComplete (i-1-w') r
+  where w' = div w 2
 
 -- /O(n)/
 span :: (a -> Bool) -> Future a -> ([a], Maybe (Future a))
